@@ -30,9 +30,11 @@ import {
   VolumeX,
   Crosshair,
   Gauge,
-  Target
+  Target,
+  Wifi
 } from 'lucide-react';
 import { translations, type Lang } from './i18n';
+import { NetworkLabModule } from './modules/network/NetworkLabModule';
 
 // ============================================================================
 // 1. TYPES & ARCHITECTURAL INTERFACES
@@ -43,6 +45,7 @@ export type TestStatus = 'PASS' | 'WARNING' | 'FAIL' | 'SKIPPED' | 'UNSUPPORTED'
 
 export type ModuleId =
   | 'dashboard'
+  | 'network'
   | 'audio'
   | 'keyboard'
   | 'mouse'
@@ -4350,6 +4353,7 @@ const GamepadLabModule: React.FC<{
 
 const getNavItems = (tNav: typeof translations.en.nav) => [
   { id: 'dashboard' as ModuleId, label: tNav.dashboard, desc: tNav.dashboardDesc, icon: <Activity className="w-4 h-4" /> },
+  { id: 'network' as ModuleId, label: tNav.network, desc: tNav.networkDesc, icon: <Wifi className="w-4 h-4" /> },
   { id: 'audio' as ModuleId, label: tNav.audio, desc: tNav.audioDesc, icon: <Volume2 className="w-4 h-4" /> },
   { id: 'keyboard' as ModuleId, label: tNav.keyboard, desc: tNav.keyboardDesc, icon: <Keyboard className="w-4 h-4" /> },
   { id: 'mouse' as ModuleId, label: tNav.mouse, desc: tNav.mouseDesc, icon: <MousePointer className="w-4 h-4" /> },
@@ -4519,6 +4523,10 @@ export function App() {
               onRefreshDevices={refreshDevices}
               lang={lang}
             />
+          )}
+
+          {activeModule === 'network' && (
+            <NetworkLabModule onAddRecord={handleAddRecord} lang={lang} />
           )}
 
           {activeModule === 'audio' && (
