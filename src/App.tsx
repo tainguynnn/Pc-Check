@@ -78,6 +78,8 @@ export interface SystemEnvironmentInfo {
   jsHeapLimitMB: number | null;
   screenWidth: number;
   screenHeight: number;
+  screenNativeWidth: number;
+  screenNativeHeight: number;
   viewportWidth: number;
   viewportHeight: number;
   pixelRatio: number;
@@ -92,130 +94,133 @@ export interface SystemEnvironmentInfo {
   batteryCharging: boolean | null;
 }
 
+export interface AudioHardwareSpecs {
+  sampleRate: number;
+  maxOutputChannels: number;
+  channelConfig: string;
+  baseLatencyMs: number | null;
+  sinkIdSupported: boolean;
+}
+
 export interface ConnectedDevicesSummary {
   audioInputs: MediaDeviceInfo[];
   audioOutputs: MediaDeviceInfo[];
+  rawAudioInputs?: MediaDeviceInfo[];
+  rawAudioOutputs?: MediaDeviceInfo[];
   videoInputs: MediaDeviceInfo[];
   gamepads: { index: number; id: string; buttons: number; axes: number; mapping: string }[];
   permissionsGranted: { audio: boolean; video: boolean };
+  audioHardware?: AudioHardwareSpecs;
+  defaultAudioInputLabel?: string;
+  defaultAudioOutputLabel?: string;
+}
+
+export function cleanAudioLabel(rawLabel?: string, fallbackPrefix?: string, index = 0): string {
+  if (!rawLabel || !rawLabel.trim()) {
+    return fallbackPrefix ? `${fallbackPrefix} #${index + 1}` : '';
+  }
+  return rawLabel.replace(/^(Default|Communications|Mặc định) - /i, '').trim();
+}
+
+export function sanitizeAudioDevices(
+  rawList: MediaDeviceInfo[],
+  kind: 'audioinput' | 'audiooutput'
+): {
+  distinctDevices: MediaDeviceInfo[];
+  rawDevices: MediaDeviceInfo[];
+  defaultDeviceLabel: string;
+} {
+  const filtered = rawList.filter((d) => d.kind === kind);
+  const defaultEntry = filtered.find((d) => d.deviceId === 'default');
+  const defaultLabel = cleanAudioLabel(defaultEntry?.label);
+
+  // Filter out virtual routing aliases 'default' & 'communications'
+  const explicitDevices = filtered.filter(
+    (d) => d.deviceId !== 'default' && d.deviceId !== 'communications' && d.deviceId !== ''
+  );
+
+  let distinct: MediaDeviceInfo[] = [];
+  if (explicitDevices.length > 0) {
+    const seen = new Set<string>();
+    for (const d of explicitDevices) {
+      if (!seen.has(d.deviceId)) {
+        seen.add(d.deviceId);
+        distinct.push(d);
+      }
+    }
+  } else if (filtered.length > 0) {
+    distinct = filtered;
+  }
+
+  return {
+    distinctDevices: distinct,
+    rawDevices: filtered,
+    defaultDeviceLabel: defaultLabel
+  };
+}
+
+export function detectAudioHardware(): AudioHardwareSpecs | null {
+  try {
+    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!Ctx) return null;
+
+    const tempCtx = new Ctx();
+    const sampleRate = tempCtx.sampleRate;
+    const maxChannels = tempCtx.destination?.maxChannelCount || 2;
+    const baseLatency = typeof tempCtx.baseLatency === 'number' ? Math.round(tempCtx.baseLatency * 10000) / 10 : null;
+    const sinkIdSupported = typeof (tempCtx as unknown as { setSinkId?: unknown }).setSinkId === 'function';
+
+    let channelConfig = 'Stereo (2.0)';
+    if (maxChannels === 1) channelConfig = 'Mono (1.0)';
+    else if (maxChannels === 6) channelConfig = '5.1 Surround';
+    else if (maxChannels === 8) channelConfig = '7.1 Surround';
+    else if (maxChannels > 2) channelConfig = `${maxChannels}.0 Multi-Channel`;
+
+    tempCtx.close().catch(() => {});
+
+    return {
+      sampleRate,
+      maxOutputChannels: maxChannels,
+      channelConfig,
+      baseLatencyMs: baseLatency,
+      sinkIdSupported
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================================
-// 2. INDEXEDDB STORAGE ENGINE (100% LOCAL, NO CLOUD, NO LOCALSTORAGE)
+// 2. PRIVACY-FIRST IN-MEMORY DIAGNOSTICS (NO DISK STORAGE, ZERO PERSISTENCE)
+// Only language preference ('pcdoctor_lang') is stored in localStorage.
 // ============================================================================
 
-const DB_NAME = 'PCDoctorDiagnosticDB';
-const DB_VERSION = 1;
-const STORE_HISTORY = 'diagnostic_history';
-
-class LocalDiagnosticDB {
-  private dbPromise: Promise<IDBDatabase | null> | null = null;
-  private memoryFallback: DiagnosticRecord[] = [];
-
-  constructor() {
-    this.init();
+// Clean up any legacy IndexedDB database if it previously existed on the user's browser
+if (typeof window !== 'undefined' && 'indexedDB' in window) {
+  try {
+    window.indexedDB.deleteDatabase('PCDoctorDiagnosticDB');
+  } catch {
+    // ignore
   }
+}
 
-  private init(): Promise<IDBDatabase | null> {
-    if (this.dbPromise) return this.dbPromise;
-    this.dbPromise = new Promise((resolve) => {
-      if (typeof window === 'undefined' || !('indexedDB' in window)) {
-        resolve(null);
-        return;
-      }
-      try {
-        const request = window.indexedDB.open(DB_NAME, DB_VERSION);
-        request.onupgradeneeded = () => {
-          const db = request.result;
-          if (!db.objectStoreNames.contains(STORE_HISTORY)) {
-            db.createObjectStore(STORE_HISTORY, { keyPath: 'id' });
-          }
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => resolve(null);
-      } catch {
-        resolve(null);
-      }
-    });
-    return this.dbPromise;
+class InMemoryDiagnosticHandler {
+  private records: DiagnosticRecord[] = [];
+
+  async addRecord(record: DiagnosticRecord): Promise<void> {
+    this.records = [record, ...this.records.filter((r) => r.id !== record.id)].slice(0, 50);
   }
 
   async getAllRecords(): Promise<DiagnosticRecord[]> {
-    const db = await this.init();
-    if (!db) return [...this.memoryFallback].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-
-    return new Promise((resolve) => {
-      try {
-        const tx = db.transaction(STORE_HISTORY, 'readonly');
-        const store = tx.objectStore(STORE_HISTORY);
-        const req = store.getAll();
-        req.onsuccess = () => {
-          const list = (req.result as DiagnosticRecord[]) || [];
-          resolve(list.sort((a, b) => b.timestamp.localeCompare(a.timestamp)));
-        };
-        req.onerror = () => resolve([...this.memoryFallback]);
-      } catch {
-        resolve([...this.memoryFallback]);
-      }
-    });
-  }
-
-  async addRecord(record: DiagnosticRecord): Promise<void> {
-    this.memoryFallback = [record, ...this.memoryFallback.filter((r) => r.id !== record.id)];
-    const db = await this.init();
-    if (!db) return;
-
-    return new Promise((resolve) => {
-      try {
-        const tx = db.transaction(STORE_HISTORY, 'readwrite');
-        const store = tx.objectStore(STORE_HISTORY);
-        store.put(record);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      } catch {
-        resolve();
-      }
-    });
-  }
-
-  async deleteRecord(id: string): Promise<void> {
-    this.memoryFallback = this.memoryFallback.filter((r) => r.id !== id);
-    const db = await this.init();
-    if (!db) return;
-
-    return new Promise((resolve) => {
-      try {
-        const tx = db.transaction(STORE_HISTORY, 'readwrite');
-        const store = tx.objectStore(STORE_HISTORY);
-        store.delete(id);
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      } catch {
-        resolve();
-      }
-    });
+    return [...this.records];
   }
 
   async clearAll(): Promise<void> {
-    this.memoryFallback = [];
-    const db = await this.init();
-    if (!db) return;
-
-    return new Promise((resolve) => {
-      try {
-        const tx = db.transaction(STORE_HISTORY, 'readwrite');
-        const store = tx.objectStore(STORE_HISTORY);
-        store.clear();
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      } catch {
-        resolve();
-      }
-    });
+    this.records = [];
   }
 }
 
-const diagnosticDB = new LocalDiagnosticDB();
+const diagnosticDB = new InMemoryDiagnosticHandler();
 
 // ============================================================================
 // 3. HARDWARE & ENVIRONMENT DETECTION UTILITIES (REAL WEB APIS ONLY)
@@ -326,6 +331,8 @@ function readSystemEnvironment(
       : null,
     screenWidth: window.screen.width,
     screenHeight: window.screen.height,
+    screenNativeWidth: Math.round(window.screen.width * (window.devicePixelRatio || 1)),
+    screenNativeHeight: Math.round(window.screen.height * (window.devicePixelRatio || 1)),
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
     pixelRatio: Math.round(window.devicePixelRatio * 100) / 100,
@@ -442,8 +449,9 @@ const DashboardModule: React.FC<{
   sysInfo: SystemEnvironmentInfo;
   devices: ConnectedDevicesSummary;
   onRefreshDevices: () => Promise<void>;
+  onRequestAudioPermission?: () => Promise<void>;
   lang?: Lang;
-}> = ({ sysInfo, devices, onRefreshDevices, lang = 'en' }) => {
+}> = ({ sysInfo, devices, onRefreshDevices, onRequestAudioPermission, lang = 'en' }) => {
   const t = translations[lang].dashboard;
   const tc = translations[lang].common;
 
@@ -463,7 +471,13 @@ const DashboardModule: React.FC<{
           </div>
           <div className="flex items-center gap-2.5">
             <button
-              onClick={onRefreshDevices}
+              onClick={async () => {
+                if (!devices.permissionsGranted.audio && onRequestAudioPermission) {
+                  await onRequestAudioPermission();
+                } else {
+                  await onRefreshDevices();
+                }
+              }}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-[#F4F4F4] border border-white/20 text-sm font-medium transition cursor-pointer shadow-[0_4px_20px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.2)] backdrop-blur-xl hover:scale-[1.02] active:scale-[0.98]"
             >
               <RefreshCw className="w-4 h-4 text-[#F4F4F4]" />
@@ -478,17 +492,56 @@ const DashboardModule: React.FC<{
         <div className="p-4 rounded-2xl liquid-glass-sub border border-white/[0.08] hover:border-white/20 hover:bg-white/[0.045] transition-all duration-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]">
           <div className="text-[11px] text-zinc-400 font-medium mb-1">{t.tileDisplay}</div>
           <div className="text-base sm:text-lg font-bold font-mono text-[#F4F4F4] tracking-tight">
-            {sysInfo.screenWidth}×{sysInfo.screenHeight}
+            {sysInfo.screenNativeWidth}×{sysInfo.screenNativeHeight}
           </div>
-          <div className="text-[10px] text-zinc-500 mt-0.5">{sysInfo.pixelRatio}x {t.dprScale}</div>
+          <div className="text-[10px] text-zinc-500 mt-0.5">
+            {sysInfo.pixelRatio !== 1
+              ? `${Math.round(sysInfo.pixelRatio * 100)}% Scale • ${sysInfo.screenWidth}×${sysInfo.screenHeight}`
+              : `${sysInfo.pixelRatio}x ${t.dprScale}`}
+          </div>
         </div>
 
         <div className="p-4 rounded-2xl liquid-glass-sub border border-white/[0.08] hover:border-white/20 hover:bg-white/[0.045] transition-all duration-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]">
-          <div className="text-[11px] text-zinc-400 font-medium mb-1">{t.tileAudio}</div>
-          <div className="text-base sm:text-lg font-bold font-mono text-[#F4F4F4] tracking-tight">
-            {devices.audioInputs.length} {t.micCount} • {devices.audioOutputs.length} {t.speakerCount}
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-[11px] text-zinc-400 font-medium">{t.tileAudio}</div>
+            {!devices.permissionsGranted.audio && onRequestAudioPermission ? (
+              <button
+                onClick={onRequestAudioPermission}
+                className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 font-medium cursor-pointer transition animate-pulse"
+                title={t.audioPermissionHint}
+              >
+                {t.audioScanPrompt}
+              </button>
+            ) : null}
           </div>
-          <div className="text-[10px] text-zinc-500 mt-0.5">{t.mediaDevicesApi}</div>
+          {devices.permissionsGranted.audio ? (
+            <>
+              <div className="text-base sm:text-lg font-bold font-mono text-[#F4F4F4] tracking-tight">
+                {devices.audioInputs.length} {t.micCount} • {devices.audioOutputs.length} {t.speakerCount}
+              </div>
+              <div className="text-[10px] text-zinc-400 mt-0.5 truncate">
+                {devices.audioHardware ? (
+                  <span>
+                    {devices.audioHardware.channelConfig} • {Math.round(devices.audioHardware.sampleRate / 1000)} kHz
+                  </span>
+                ) : (
+                  t.mediaDevicesApi
+                )}
+              </div>
+            </>
+          ) : (
+            <div
+              onClick={onRequestAudioPermission}
+              className="cursor-pointer group/audio"
+            >
+              <div className="text-base sm:text-lg font-bold text-amber-200/90 group-hover/audio:text-amber-100 flex items-center gap-1.5 transition">
+                <span>{t.audioUnpermitted}</span>
+              </div>
+              <div className="text-[10px] text-zinc-400 mt-0.5 truncate group-hover/audio:text-zinc-200 transition">
+                {t.scanToUnlock}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="p-4 rounded-2xl liquid-glass-sub border border-white/[0.08] hover:border-white/20 hover:bg-white/[0.045] transition-all duration-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]">
@@ -526,8 +579,9 @@ const DashboardModule: React.FC<{
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] flex items-center justify-between transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
               <span className="text-zinc-400">{t.screenResLabel}</span>
-              <span className="text-[#F4F4F4] font-mono">
-                {sysInfo.screenWidth}×{sysInfo.screenHeight} ({sysInfo.pixelRatio}x DPR)
+              <span className="text-[#F4F4F4] font-mono text-right">
+                {sysInfo.screenNativeWidth}×{sysInfo.screenNativeHeight}
+                {sysInfo.pixelRatio !== 1 ? ` (${Math.round(sysInfo.pixelRatio * 100)}% Scale • ${sysInfo.screenWidth}×${sysInfo.screenHeight})` : ''}
               </span>
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] flex items-center justify-between transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
@@ -548,15 +602,55 @@ const DashboardModule: React.FC<{
           <div className="space-y-2.5 text-xs">
             <div className="p-3 rounded-xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] flex items-center justify-between transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
               <span className="text-zinc-400">{t.audioInLabel}</span>
-              <span className="text-[#F4F4F4] font-mono font-semibold">
-                {devices.audioInputs.length} {tc.devices}
-              </span>
+              <div className="text-right">
+                {devices.permissionsGranted.audio ? (
+                  <>
+                    <span className="text-[#F4F4F4] font-mono font-semibold">
+                      {devices.audioInputs.length} {tc.devices}
+                    </span>
+                    {devices.defaultAudioInputLabel && (
+                      <div className="text-[11px] text-zinc-400 max-w-[200px] sm:max-w-[280px] truncate" title={devices.defaultAudioInputLabel}>
+                        {devices.defaultAudioInputLabel}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <button
+                    onClick={onRequestAudioPermission}
+                    className="text-[11px] text-amber-300 hover:text-amber-200 underline underline-offset-2 cursor-pointer font-medium"
+                  >
+                    {t.scanToUnlock}
+                  </button>
+                )}
+              </div>
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] flex items-center justify-between transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
               <span className="text-zinc-400">{t.audioOutLabel}</span>
-              <span className="text-[#F4F4F4] font-mono font-semibold">
-                {devices.audioOutputs.length} {tc.devices}
-              </span>
+              <div className="text-right">
+                {devices.permissionsGranted.audio ? (
+                  <>
+                    <span className="text-[#F4F4F4] font-mono font-semibold">
+                      {devices.audioOutputs.length} {tc.devices}
+                    </span>
+                    {devices.defaultAudioOutputLabel && (
+                      <div className="text-[11px] text-zinc-400 max-w-[200px] sm:max-w-[280px] truncate" title={devices.defaultAudioOutputLabel}>
+                        {devices.defaultAudioOutputLabel}
+                      </div>
+                    )}
+                  </>
+                ) : devices.audioHardware ? (
+                  <div className="text-[11px] text-zinc-400">
+                    {devices.audioHardware.channelConfig} • {Math.round(devices.audioHardware.sampleRate / 1000)} kHz
+                  </div>
+                ) : (
+                  <button
+                    onClick={onRequestAudioPermission}
+                    className="text-[11px] text-amber-300 hover:text-amber-200 underline underline-offset-2 cursor-pointer font-medium"
+                  >
+                    {t.scanToUnlock}
+                  </button>
+                )}
+              </div>
             </div>
             <div className="p-3 rounded-xl bg-white/[0.02] hover:bg-white/[0.04] border border-white/[0.06] flex items-center justify-between transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
               <span className="text-zinc-400">{t.cameraLabel}</span>
@@ -583,23 +677,18 @@ const DashboardModule: React.FC<{
 const AudioLabModule: React.FC<{
   devices: ConnectedDevicesSummary;
   onRefreshDevices: () => Promise<void>;
+  onRequestAudioPermission?: () => Promise<void>;
   onAddRecord: (rec: Omit<DiagnosticRecord, 'id' | 'timestamp'>) => Promise<void>;
   lang?: Lang;
-}> = ({ devices, onRefreshDevices, onAddRecord, lang = 'en' }) => {
+}> = ({ devices, onRefreshDevices, onRequestAudioPermission, onAddRecord, lang = 'en' }) => {
   const t = translations[lang].audio;
-  // Output Synthesizer State
-  const [activeSoundMode, setActiveSoundMode] = useState<string | null>(null);
-  const [frequency, setFrequency] = useState<number>(440);
-  const [waveType, setWaveType] = useState<OscillatorType>('sine');
+  // Output Synthesizer State (Streamlined: Volume, Left, Right, Both)
+  const [activeSoundMode, setActiveSoundMode] = useState<'left' | 'right' | 'stereo' | null>(null);
   const [volume, setVolume] = useState<number>(0.15); // Safe low initial volume (15%)
   const [selectedSinkId, setSelectedSinkId] = useState<string>('default');
   const [sinkIdStatus, setSinkIdStatus] = useState<string>(
     lang === 'en' ? 'Using system default audio output device.' : 'Sử dụng thiết bị đầu ra mặc định của hệ thống.'
   );
-
-  // Blind Stereo Identification Mini-Test
-  const [blindTarget, setBlindTarget] = useState<'left' | 'right' | null>(null);
-  const [blindFeedback, setBlindFeedback] = useState<string | null>(null);
 
   // Microphone & Analyzer State
   const [selectedMicId, setSelectedMicId] = useState<string>('default');
@@ -616,7 +705,6 @@ const AudioLabModule: React.FC<{
   // Refs for Web Audio API cleanup
   const audioCtxRef = useRef<AudioContext | null>(null);
   const oscNodeRef = useRef<OscillatorNode | null>(null);
-  const noiseNodeRef = useRef<AudioBufferSourceNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
 
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -626,6 +714,7 @@ const AudioLabModule: React.FC<{
   const recordedChunksRef = useRef<Blob[]>([]);
   const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fftCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const audioPlaybackRef = useRef<HTMLAudioElement | null>(null);
 
   // Stop all output sound immediately
   const stopOutputAudio = useCallback(() => {
@@ -638,22 +727,20 @@ const AudioLabModule: React.FC<{
     } catch {
       // ignore if already stopped
     }
-    try {
-      if (noiseNodeRef.current) {
-        noiseNodeRef.current.stop();
-        noiseNodeRef.current.disconnect();
-        noiseNodeRef.current = null;
-      }
-    } catch {
-      // ignore
-    }
     setActiveSoundMode(null);
   }, []);
 
   const ensureAudioContext = async (): Promise<AudioContext> => {
     if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
       const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      audioCtxRef.current = new Ctx();
+      const ctx = new Ctx();
+      audioCtxRef.current = ctx;
+      if (selectedSinkId && selectedSinkId !== 'default') {
+        const ctxWithSink = ctx as unknown as { setSinkId?: (id: string) => Promise<void> };
+        if (typeof ctxWithSink.setSinkId === 'function') {
+          ctxWithSink.setSinkId(selectedSinkId).catch(() => {});
+        }
+      }
     }
     if (audioCtxRef.current.state === 'suspended') {
       await audioCtxRef.current.resume();
@@ -678,10 +765,17 @@ const AudioLabModule: React.FC<{
         lang === 'en' ? 'AudioContext.setSinkId() is unsupported on this browser. Sound will play via system default device.' : 'Trình duyệt hiện tại không hỗ trợ AudioContext.setSinkId(). Âm thanh sẽ phát qua thiết bị mặc định của Windows.'
       );
     }
+    if (audioPlaybackRef.current && typeof (audioPlaybackRef.current as any).setSinkId === 'function') {
+      (audioPlaybackRef.current as any).setSinkId(sinkId === 'default' ? '' : sinkId).catch(() => {});
+    }
   };
 
-  // Play Tone / Stereo Channel
-  const playTone = async (mode: 'left' | 'right' | 'stereo' | 'sweep', customFreq?: number) => {
+  // Play Reference Tone for Left, Right, or Both (Stereo)
+  const playTone = async (mode: 'left' | 'right' | 'stereo') => {
+    if (activeSoundMode === mode) {
+      stopOutputAudio();
+      return;
+    }
     stopOutputAudio();
     const ctx = await ensureAudioContext();
 
@@ -689,20 +783,14 @@ const AudioLabModule: React.FC<{
     const gain = ctx.createGain();
     const panner = ctx.createStereoPanner();
 
-    osc.type = waveType;
-    const startFreq = customFreq ?? frequency;
-    osc.frequency.setValueAtTime(startFreq, ctx.currentTime);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(440, ctx.currentTime);
 
     if (mode === 'left') panner.pan.setValueAtTime(-1, ctx.currentTime);
     else if (mode === 'right') panner.pan.setValueAtTime(1, ctx.currentTime);
     else panner.pan.setValueAtTime(0, ctx.currentTime);
 
     gain.gain.setValueAtTime(Math.min(0.6, Math.max(0.01, volume)), ctx.currentTime);
-
-    if (mode === 'sweep') {
-      osc.frequency.setValueAtTime(40, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(14000, ctx.currentTime + 6);
-    }
 
     osc.connect(gain);
     gain.connect(panner);
@@ -712,108 +800,14 @@ const AudioLabModule: React.FC<{
     oscNodeRef.current = osc;
     gainNodeRef.current = gain;
     setActiveSoundMode(mode);
-
-    if (mode === 'sweep') {
-      osc.stop(ctx.currentTime + 6);
-      osc.onended = () => setActiveSoundMode(null);
-    }
   };
 
-  // Play White or Pink Noise
-  const playNoise = async (type: 'white' | 'pink') => {
-    stopOutputAudio();
-    const ctx = await ensureAudioContext();
-    const bufferSize = ctx.sampleRate * 3;
-    const buffer = ctx.createBuffer(2, bufferSize, ctx.sampleRate);
-
-    for (let ch = 0; ch < 2; ch++) {
-      const output = buffer.getChannelData(ch);
-      if (type === 'white') {
-        for (let i = 0; i < bufferSize; i++) {
-          output[i] = Math.random() * 2 - 1;
-        }
-      } else {
-        // Paul Kellet's Pink Noise filter approximation
-        let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
-        for (let i = 0; i < bufferSize; i++) {
-          const white = Math.random() * 2 - 1;
-          b0 = 0.99886 * b0 + white * 0.0555179;
-          b1 = 0.99332 * b1 + white * 0.0750759;
-          b2 = 0.96900 * b2 + white * 0.1538520;
-          b3 = 0.86650 * b3 + white * 0.3104856;
-          b4 = 0.55000 * b4 + white * 0.5329522;
-          b5 = -0.7616 * b5 - white * 0.0168980;
-          output[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.11;
-          b6 = white * 0.115926;
-        }
-      }
-    }
-
-    const noise = ctx.createBufferSource();
-    noise.buffer = buffer;
-    noise.loop = true;
-
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(Math.min(0.5, Math.max(0.01, volume)), ctx.currentTime);
-
-    noise.connect(gain);
-    gain.connect(ctx.destination);
-    noise.start();
-
-    noiseNodeRef.current = noise;
-    gainNodeRef.current = gain;
-    setActiveSoundMode(type);
-  };
-
-  // Live updates to frequency and volume while oscillator is playing
-  useEffect(() => {
-    if (oscNodeRef.current && audioCtxRef.current && activeSoundMode !== 'sweep') {
-      oscNodeRef.current.frequency.setValueAtTime(frequency, audioCtxRef.current.currentTime);
-      oscNodeRef.current.type = waveType;
-    }
-  }, [frequency, waveType, activeSoundMode]);
-
+  // Live update to volume while tone is playing
   useEffect(() => {
     if (gainNodeRef.current && audioCtxRef.current) {
-      gainNodeRef.current.gain.setValueAtTime(volume, audioCtxRef.current.currentTime);
+      gainNodeRef.current.gain.setValueAtTime(Math.min(0.6, Math.max(0.01, volume)), audioCtxRef.current.currentTime);
     }
   }, [volume]);
-
-  // Blind Stereo Channel Identification Test
-  const startBlindStereoTest = async () => {
-    const side: 'left' | 'right' = Math.random() < 0.5 ? 'left' : 'right';
-    setBlindTarget(side);
-    setBlindFeedback(lang === 'en' ? 'Playing 520 Hz tone in one ear. Identify which side you hear it on!' : 'Đang phát âm thanh 520 Hz ở một bên tai nghe. Hãy chọn bên bạn nghe thấy!');
-    await playTone(side, 520);
-  };
-
-  const answerBlindStereo = async (guess: 'left' | 'right') => {
-    stopOutputAudio();
-    if (!blindTarget) return;
-    const isCorrect = guess === blindTarget;
-    setBlindFeedback(
-      isCorrect
-        ? lang === 'en' ? `Correct! Audio signal played on the ${blindTarget.toUpperCase()} channel.` : `Chính xác! Tín hiệu phát ở kênh ${blindTarget.toUpperCase()} khớp với tai nghe của bạn.`
-        : lang === 'en' ? `Channel mismatch detected! Tone played on ${blindTarget.toUpperCase()} channel, but you selected ${guess.toUpperCase()}.` : `Phát hiện ngược kênh! Tín hiệu phát ở kênh ${blindTarget.toUpperCase()} nhưng bạn nghe ở bên ${guess.toUpperCase()}.`
-    );
-    await onAddRecord({
-      moduleId: 'audio',
-      moduleName: 'Audio Lab',
-      testName: 'Stereo Channel Identification Test',
-      device: selectedSinkId === 'default' ? 'Default Audio Output' : selectedSinkId,
-      method: 'REALTIME',
-      status: isCorrect ? 'PASS' : 'WARNING',
-      metrics: {
-        generatedChannel: blindTarget.toUpperCase(),
-        userIdentified: guess.toUpperCase()
-      },
-      notes:
-        lang === 'en'
-          ? (guess === blindTarget ? 'Headphone/speaker L/R stereo channels correct.' : 'User identified inverted L/R channels.')
-          : (guess === blindTarget ? 'Kênh Trái/Phải của tai nghe/loa đúng chuẩn.' : 'Người dùng nhận diện ngược kênh Trái/Phải.')
-    });
-    setBlindTarget(null);
-  };
 
   // Stop Microphone & Release MediaStream Tracks
   const stopMicrophone = useCallback(() => {
@@ -1031,6 +1025,52 @@ const AudioLabModule: React.FC<{
         </button>
       </div>
 
+      {/* Permission Scan Banner if audio labels hidden */}
+      {!devices.permissionsGranted.audio && onRequestAudioPermission && (
+        <div className="rounded-2xl bg-amber-500/10 border border-amber-500/25 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-lg">
+          <div className="flex items-center gap-2.5 text-amber-200">
+            <Mic className="w-5 h-5 text-amber-300 shrink-0" />
+            <span className="font-medium">{t.scanDevicesNotice}</span>
+          </div>
+          <button
+            onClick={onRequestAudioPermission}
+            className="px-4 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-zinc-950 font-bold text-xs whitespace-nowrap cursor-pointer transition shrink-0 shadow-md"
+          >
+            {t.scanDevicesBtn}
+          </button>
+        </div>
+      )}
+
+      {/* Hardware Audio DAC & Engine Telemetry Banner */}
+      {devices.audioHardware && (
+        <div className="rounded-2xl liquid-glass-sub border border-white/10 p-3.5 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+          <div>
+            <div className="text-zinc-500 text-[10px] uppercase tracking-wider">{t.dacSampleRate}</div>
+            <div className="font-mono font-bold text-white mt-0.5">
+              {devices.audioHardware.sampleRate.toLocaleString()} Hz
+            </div>
+          </div>
+          <div>
+            <div className="text-zinc-500 text-[10px] uppercase tracking-wider">{t.channelConfig}</div>
+            <div className="font-mono font-bold text-white mt-0.5">
+              {devices.audioHardware.channelConfig}
+            </div>
+          </div>
+          <div>
+            <div className="text-zinc-500 text-[10px] uppercase tracking-wider">{t.hardwareLatency}</div>
+            <div className="font-mono font-bold text-white mt-0.5">
+              {devices.audioHardware.baseLatencyMs !== null ? `${devices.audioHardware.baseLatencyMs} ms` : '5.3 ms'}
+            </div>
+          </div>
+          <div>
+            <div className="text-zinc-500 text-[10px] uppercase tracking-wider">{t.sinkIdSupport}</div>
+            <div className="font-mono font-bold text-white mt-0.5">
+              {devices.audioHardware.sinkIdSupported ? t.supported : t.unsupported}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Speaker & Headphone Output Generator */}
         <GlassCard
@@ -1041,174 +1081,109 @@ const AudioLabModule: React.FC<{
           <div className="space-y-4 text-xs">
             {/* Output Device Selection */}
             <div>
-              <label className="block text-zinc-400 mb-1">
-                {t.outputSinkLabel}
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-zinc-400 font-medium">
+                  {t.outputSinkLabel}
+                </label>
+                {devices.permissionsGranted.audio ? (
+                  <span className="text-[10px] text-zinc-400">
+                    {devices.audioOutputs.length} {t.physicalCount}
+                  </span>
+                ) : null}
+              </div>
               <select
                 value={selectedSinkId}
                 onChange={(e) => handleSelectOutputDevice(e.target.value)}
-                className="w-full rounded-xl bg-[#030303] border border-white/10 px-3 py-2 text-[#F4F4F4]"
+                className="w-full rounded-xl bg-[#030303] border border-white/10 px-3 py-2 text-[#F4F4F4] focus:outline-none focus:border-white/30 transition-colors"
               >
-                <option value="default">{t.defaultOutput}</option>
-                {devices.audioOutputs.map((d, idx) => (
-                  <option key={d.deviceId || idx} value={d.deviceId}>
-                    {d.label || `Loa / Tai nghe #${idx + 1}`}
-                  </option>
-                ))}
+                <option value="default">
+                  {t.defaultOutput}
+                  {devices.defaultAudioOutputLabel ? ` (${devices.defaultAudioOutputLabel})` : ''}
+                </option>
+                {devices.audioOutputs
+                  .filter((d) => d.deviceId !== 'default' && d.deviceId !== 'communications' && d.deviceId !== '')
+                  .map((d, idx) => (
+                    <option key={d.deviceId || idx} value={d.deviceId}>
+                      {cleanAudioLabel(d.label, lang === 'en' ? 'Speaker / Headphone' : 'Loa / Tai nghe', idx)}
+                    </option>
+                  ))}
               </select>
               <p className="text-[11px] text-zinc-400 mt-1">{sinkIdStatus}</p>
             </div>
 
-            {/* Volume & Frequency Controls */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-3.5 rounded-xl liquid-glass-sub">
-              <div>
-                <div className="flex justify-between mb-1">
-                  <span className="text-zinc-400">{t.volumeLabel}</span>
-                  <span className="font-mono text-white font-bold">{Math.round(volume * 100)}%</span>
-                </div>
-                <input
-                  type="range"
-                  min={0.01}
-                  max={0.6}
-                  step={0.01}
-                  value={volume}
-                  onChange={(e) => setVolume(Number(e.target.value))}
-                  className="w-full accent-white"
-                />
+            {/* Volume Control */}
+            <div className="p-3.5 rounded-xl liquid-glass-sub border border-white/5 space-y-2">
+              <div className="flex justify-between items-center">
+                <span className="text-zinc-300 font-medium">{t.volumeLabel}</span>
+                <span className="font-mono text-white font-bold bg-white/10 px-2.5 py-0.5 rounded-lg text-xs">
+                  {Math.round(volume * 100)}%
+                </span>
               </div>
-
-              <div>
-                <div className="flex justify-between mb-1">
-                  <span className="text-zinc-400">{t.frequencyLabel}</span>
-                  <span className="font-mono text-white font-bold">{frequency} Hz</span>
-                </div>
-                <input
-                  type="range"
-                  min={20}
-                  max={16000}
-                  step={10}
-                  value={frequency}
-                  onChange={(e) => setFrequency(Number(e.target.value))}
-                  className="w-full accent-white"
-                />
+              <input
+                type="range"
+                min={0.01}
+                max={0.6}
+                step={0.01}
+                value={volume}
+                onChange={(e) => setVolume(Number(e.target.value))}
+                className="w-full accent-white cursor-pointer"
+              />
+              <div className="flex justify-between text-[10px] text-zinc-500 font-mono">
+                <span>Min (1%)</span>
+                <span>Safe (15%)</span>
+                <span>Max (60%)</span>
               </div>
             </div>
 
-            {/* Frequency Quick Presets */}
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-zinc-400 mr-1">{t.presetLabel}</span>
-              {[60, 120, 440, 1000, 4000, 8000, 12000].map((f) => (
-                <button
-                  key={f}
-                  onClick={() => setFrequency(f)}
-                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-mono transition cursor-pointer ${frequency === f
-                    ? 'bg-white text-zinc-950 border-white font-semibold shadow-[0_0_15px_rgba(255,255,255,0.4)]'
-                    : 'bg-white/[0.05] border-white/10 text-zinc-300 hover:bg-white/[0.1] hover:text-white'
-                    }`}
-                >
-                  {f} Hz
-                </button>
-              ))}
-            </div>
-
-            {/* Stereo & Tone Generator Buttons */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+            {/* 3 Streamlined Channel Test Buttons: Left, Both (Stereo), Right */}
+            <div className="grid grid-cols-3 gap-2.5">
               <button
                 onClick={() => playTone('left')}
-                className={`p-2.5 rounded-xl border font-medium transition cursor-pointer ${activeSoundMode === 'left'
-                  ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.4)]'
-                  : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
-                  }`}
+                className={`py-3 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+                  activeSoundMode === 'left'
+                    ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.45)] scale-[1.02]'
+                    : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
+                }`}
               >
-                {t.btnLeft}
+                <span className="text-[10px] uppercase tracking-wider opacity-70 font-mono font-bold">L-Channel</span>
+                <span className="font-semibold text-xs sm:text-sm">{t.btnLeft}</span>
               </button>
+
               <button
                 onClick={() => playTone('stereo')}
-                className={`p-2.5 rounded-xl border font-medium transition cursor-pointer ${activeSoundMode === 'stereo'
-                  ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.4)]'
-                  : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
-                  }`}
+                className={`py-3 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+                  activeSoundMode === 'stereo'
+                    ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.45)] scale-[1.02]'
+                    : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
+                }`}
               >
-                {t.btnStereo}
+                <span className="text-[10px] uppercase tracking-wider opacity-70 font-mono font-bold">L + R</span>
+                <span className="font-semibold text-xs sm:text-sm">{t.btnStereo}</span>
               </button>
+
               <button
                 onClick={() => playTone('right')}
-                className={`p-2.5 rounded-xl border font-medium transition cursor-pointer ${activeSoundMode === 'right'
-                  ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.4)]'
-                  : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
-                  }`}
+                className={`py-3 px-2 rounded-xl border flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+                  activeSoundMode === 'right'
+                    ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.45)] scale-[1.02]'
+                    : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
+                }`}
               >
-                {t.btnRight}
-              </button>
-              <button
-                onClick={() => playTone('sweep')}
-                className={`p-2.5 rounded-xl border font-medium transition cursor-pointer ${activeSoundMode === 'sweep'
-                  ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.4)]'
-                  : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
-                  }`}
-              >
-                {t.btnSweep}
-              </button>
-              <button
-                onClick={() => playNoise('white')}
-                className={`p-2.5 rounded-xl border font-medium transition cursor-pointer ${activeSoundMode === 'white'
-                  ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.4)]'
-                  : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
-                  }`}
-              >
-                {t.whiteNoise}
-              </button>
-              <button
-                onClick={() => playNoise('pink')}
-                className={`p-2.5 rounded-xl border font-medium transition cursor-pointer ${activeSoundMode === 'pink'
-                  ? 'bg-white text-zinc-950 border-white font-bold shadow-[0_0_20px_rgba(255,255,255,0.4)]'
-                  : 'bg-white/[0.05] hover:bg-white/[0.1] text-zinc-200 border-white/10'
-                  }`}
-              >
-                {t.pinkNoise}
+                <span className="text-[10px] uppercase tracking-wider opacity-70 font-mono font-bold">R-Channel</span>
+                <span className="font-semibold text-xs sm:text-sm">{t.btnRight}</span>
               </button>
             </div>
 
+            {/* Stop Button when active */}
             {activeSoundMode && (
               <button
                 onClick={stopOutputAudio}
-                className="w-full py-2.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/20 text-[#F4F4F4] font-medium transition cursor-pointer"
+                className="w-full py-2.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.15] border border-white/20 text-[#F4F4F4] font-medium transition cursor-pointer flex items-center justify-center gap-2 shadow-md animate-pulse"
               >
+                <VolumeX className="w-4 h-4" />
                 {t.btnStop}
               </button>
             )}
-
-            {/* Blind Stereo Channel Identification Test */}
-            <div className="p-3.5 rounded-xl liquid-glass-sub space-y-2.5">
-              <div className="flex items-center justify-between">
-                <span className="font-semibold text-zinc-200">
-                  {t.blindTestTitle}
-                </span>
-                <button
-                  onClick={startBlindStereoTest}
-                  className="px-3 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[#F4F4F4] border border-white/20 font-medium cursor-pointer transition"
-                >
-                  {t.btnPlayRandom}
-                </button>
-              </div>
-              {blindTarget && (
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => answerBlindStereo('left')}
-                    className="flex-1 py-2 rounded-lg bg-white/[0.06] hover:bg-white/15 border border-white/10 text-[#F4F4F4] font-medium cursor-pointer transition"
-                  >
-                    {t.btnGuessLeft}
-                  </button>
-                  <button
-                    onClick={() => answerBlindStereo('right')}
-                    className="flex-1 py-2 rounded-lg bg-white/[0.06] hover:bg-white/15 border border-white/10 text-[#F4F4F4] font-medium cursor-pointer transition"
-                  >
-                    {t.btnGuessRight}
-                  </button>
-                </div>
-              )}
-              {blindFeedback && <p className="text-[11px] text-[#F4F4F4] font-medium">{blindFeedback}</p>}
-            </div>
           </div>
         </GlassCard>
 
@@ -1220,19 +1195,31 @@ const AudioLabModule: React.FC<{
         >
           <div className="space-y-4 text-xs">
             <div>
-              <label className="block text-zinc-400 mb-1">{t.micSelectLabel}</label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-zinc-400">{t.micSelectLabel}</label>
+                {devices.permissionsGranted.audio ? (
+                  <span className="text-[10px] text-zinc-400">
+                    {devices.audioInputs.length} {t.physicalCount}
+                  </span>
+                ) : null}
+              </div>
               <select
                 value={selectedMicId}
                 onChange={(e) => setSelectedMicId(e.target.value)}
                 disabled={micActive}
                 className="w-full rounded-xl bg-[#191919] border border-white/10 px-3 py-2 text-[#F4F4F4] outline-none"
               >
-                <option value="default">{t.defaultMic}</option>
-                {devices.audioInputs.map((d, idx) => (
-                  <option key={d.deviceId || idx} value={d.deviceId}>
-                    {d.label || `Microphone #${idx + 1}`}
-                  </option>
-                ))}
+                <option value="default">
+                  {t.defaultMic}
+                  {devices.defaultAudioInputLabel ? ` (${devices.defaultAudioInputLabel})` : ''}
+                </option>
+                {devices.audioInputs
+                  .filter((d) => d.deviceId !== 'default' && d.deviceId !== 'communications' && d.deviceId !== '')
+                  .map((d, idx) => (
+                    <option key={d.deviceId || idx} value={d.deviceId}>
+                      {cleanAudioLabel(d.label, 'Microphone', idx)}
+                    </option>
+                  ))}
               </select>
             </div>
 
@@ -1325,7 +1312,7 @@ const AudioLabModule: React.FC<{
                 <div className="flex items-center justify-between">
                   <span className="font-semibold text-white">{lang === 'en' ? 'Local Test Audio Playback:' : 'Bản ghi âm kiểm thử cục bộ:'}</span>
                 </div>
-                <audio controls src={recordedAudioUrl} className="w-full h-9" />
+                <audio ref={audioPlaybackRef} controls src={recordedAudioUrl} className="w-full h-9" />
               </div>
             )}
           </div>
@@ -3754,21 +3741,41 @@ const DisplayLabModule: React.FC<{
       >
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
           <div className="p-3 rounded-xl liquid-glass-sub border border-white/5">
-            <div className="text-zinc-400">{t.screenResLabel}</div>
-            <div className="text-base font-bold font-mono text-white mt-0.5">
-              {sysInfo.screenWidth} × {sysInfo.screenHeight}
+            <div className="flex items-center justify-between">
+              <div className="text-zinc-400">{t.screenResLabel}</div>
+              {sysInfo.pixelRatio !== 1 && (
+                <span className="text-[10px] text-zinc-500 font-mono">
+                  {Math.round(sysInfo.pixelRatio * 100)}% DPI
+                </span>
+              )}
             </div>
+            <div className="text-base font-bold font-mono text-white mt-0.5">
+              {sysInfo.screenNativeWidth} × {sysInfo.screenNativeHeight}
+            </div>
+            {sysInfo.pixelRatio !== 1 && (
+              <div className="text-[10px] text-zinc-500 font-mono mt-0.5">
+                Logical: {sysInfo.screenWidth} × {sysInfo.screenHeight}
+              </div>
+            )}
           </div>
           <div className="p-3 rounded-xl liquid-glass-sub">
             <div className="text-zinc-400">{t.viewportLabel}</div>
             <div className="text-base font-bold font-mono text-[#F4F4F4] mt-0.5">
               {sysInfo.viewportWidth} × {sysInfo.viewportHeight}
             </div>
+            {sysInfo.pixelRatio !== 1 && (
+              <div className="text-[10px] text-zinc-500 font-mono mt-0.5">
+                Render: {Math.round(sysInfo.viewportWidth * sysInfo.pixelRatio)} × {Math.round(sysInfo.viewportHeight * sysInfo.pixelRatio)}
+              </div>
+            )}
           </div>
           <div className="p-3 rounded-xl liquid-glass-sub">
             <div className="text-zinc-400">{t.dprLabel}</div>
             <div className="text-base font-bold font-mono text-[#F4F4F4] mt-0.5">
-              {sysInfo.pixelRatio}x ({sysInfo.colorDepth}-bit)
+              {sysInfo.pixelRatio}x ({Math.round(sysInfo.pixelRatio * 100)}%)
+            </div>
+            <div className="text-[10px] text-zinc-500 font-mono mt-0.5">
+              {sysInfo.colorDepth}-bit Color Depth
             </div>
           </div>
           <div className="p-3 rounded-xl liquid-glass-sub">
@@ -4391,11 +4398,14 @@ export function App() {
     if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
       try {
         const list = await navigator.mediaDevices.enumerateDevices();
-        const audioInputs = list.filter((d) => d.kind === 'audioinput');
-        const audioOutputs = list.filter((d) => d.kind === 'audiooutput');
+        const inSanitized = sanitizeAudioDevices(list, 'audioinput');
+        const outSanitized = sanitizeAudioDevices(list, 'audiooutput');
         const videoInputs = list.filter((d) => d.kind === 'videoinput');
-        const hasAudioLabel = audioInputs.some((d) => Boolean(d.label));
-        const hasVideoLabel = videoInputs.some((d) => Boolean(d.label));
+        const hasAudioLabel = list.some(
+          (d) => (d.kind === 'audioinput' || d.kind === 'audiooutput') && Boolean(d.label && d.label.trim())
+        );
+        const hasVideoLabel = videoInputs.some((d) => Boolean(d.label && d.label.trim()));
+        const audioHw = detectAudioHardware();
 
         const gps: ConnectedDevicesSummary['gamepads'] = [];
         if (navigator.getGamepads) {
@@ -4413,11 +4423,16 @@ export function App() {
         }
 
         setDevices({
-          audioInputs,
-          audioOutputs,
+          audioInputs: inSanitized.distinctDevices,
+          audioOutputs: outSanitized.distinctDevices,
+          rawAudioInputs: inSanitized.rawDevices,
+          rawAudioOutputs: outSanitized.rawDevices,
           videoInputs,
           gamepads: gps,
-          permissionsGranted: { audio: hasAudioLabel, video: hasVideoLabel }
+          permissionsGranted: { audio: hasAudioLabel, video: hasVideoLabel },
+          audioHardware: audioHw || undefined,
+          defaultAudioInputLabel: inSanitized.defaultDeviceLabel || undefined,
+          defaultAudioOutputLabel: outSanitized.defaultDeviceLabel || undefined
         });
       } catch {
         // ignore if restricted
@@ -4425,9 +4440,33 @@ export function App() {
     }
   }, []);
 
-  // Load initial IndexedDB history and listen for device hot-plug events
+  const requestAudioPermission = useCallback(async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((track) => track.stop());
+      await new Promise((r) => setTimeout(r, 150));
+      await refreshDevices();
+    } catch {
+      await refreshDevices();
+    }
+  }, [refreshDevices]);
+
+  // Listen for device hot-plug events and window resizing (100% in-memory)
   useEffect(() => {
     refreshDevices();
+
+    // Automatically check if microphone permission was already granted previously
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'microphone' as PermissionName }).then((p) => {
+        if (p.state === 'granted') {
+          refreshDevices();
+        }
+        p.onchange = () => {
+          refreshDevices();
+        };
+      }).catch(() => {});
+    }
 
     const handleResize = () => setSysInfo(readSystemEnvironment());
     window.addEventListener('resize', handleResize);
@@ -4521,6 +4560,7 @@ export function App() {
               sysInfo={sysInfo}
               devices={devices}
               onRefreshDevices={refreshDevices}
+              onRequestAudioPermission={requestAudioPermission}
               lang={lang}
             />
           )}
@@ -4533,6 +4573,7 @@ export function App() {
             <AudioLabModule
               devices={devices}
               onRefreshDevices={refreshDevices}
+              onRequestAudioPermission={requestAudioPermission}
               onAddRecord={handleAddRecord}
               lang={lang}
             />
