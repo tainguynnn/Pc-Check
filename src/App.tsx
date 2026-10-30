@@ -26,7 +26,6 @@ import {
   Usb,
   Sparkles,
   Check,
-  Code,
   VolumeX,
   Crosshair,
   Gauge,
@@ -226,7 +225,9 @@ const diagnosticDB = new InMemoryDiagnosticHandler();
 // 3. HARDWARE & ENVIRONMENT DETECTION UTILITIES (REAL WEB APIS ONLY)
 // ============================================================================
 
+let cachedOSAndBrowser: { os: string; browser: string } | null = null;
 function detectOSAndBrowser(): { os: string; browser: string } {
+  if (cachedOSAndBrowser) return cachedOSAndBrowser;
   const ua = navigator.userAgent;
   let os = 'Unknown OS';
   if (ua.includes('Windows NT 10.0')) os = 'Windows 10 / 11 (NT 10.0)';
@@ -251,8 +252,16 @@ function detectOSAndBrowser(): { os: string; browser: string } {
     browser = 'Apple Safari';
   }
 
-  return { os, browser };
+  cachedOSAndBrowser = { os, browser };
+  return cachedOSAndBrowser;
 }
+
+let cachedWebGLInfo: {
+  vendor: string;
+  renderer: string;
+  version: string;
+  maxTextureSize: number | null;
+} | null = null;
 
 function getWebGLInfo(): {
   vendor: string;
@@ -260,18 +269,21 @@ function getWebGLInfo(): {
   version: string;
   maxTextureSize: number | null;
 } {
+  if (cachedWebGLInfo) return cachedWebGLInfo;
+
   try {
     const canvas = document.createElement('canvas');
     const gl =
       (canvas.getContext('webgl2') as WebGL2RenderingContext | null) ||
       (canvas.getContext('webgl') as WebGLRenderingContext | null);
     if (!gl) {
-      return {
+      cachedWebGLInfo = {
         vendor: 'UNSUPPORTED',
         renderer: 'WebGL Disabled or Unavailable',
         version: 'None',
         maxTextureSize: null
       };
+      return cachedWebGLInfo;
     }
     const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
     const vendor = debugInfo
@@ -282,19 +294,28 @@ function getWebGLInfo(): {
       : gl.getParameter(gl.RENDERER);
     const version = gl.getParameter(gl.VERSION);
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    return {
+
+    // Immediately release WebGL context and GPU resources
+    const loseContext = gl.getExtension('WEBGL_lose_context');
+    if (loseContext) {
+      loseContext.loseContext();
+    }
+
+    cachedWebGLInfo = {
       vendor: String(vendor || 'Generic Vendor'),
       renderer: String(renderer || 'Generic WebGL Renderer'),
       version: String(version || 'WebGL'),
       maxTextureSize: typeof maxTextureSize === 'number' ? maxTextureSize : null
     };
+    return cachedWebGLInfo;
   } catch {
-    return {
+    cachedWebGLInfo = {
       vendor: 'LIMITED',
       renderer: 'Restricted by Browser Privacy Settings',
       version: 'Unknown',
       maxTextureSize: null
     };
+    return cachedWebGLInfo;
   }
 }
 
@@ -997,8 +1018,15 @@ const AudioLabModule: React.FC<{
     return () => {
       stopOutputAudio();
       stopMicrophone();
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+      }
+      if (recordedAudioUrl) {
+        URL.revokeObjectURL(recordedAudioUrl);
+      }
     };
-  }, [stopOutputAudio, stopMicrophone]);
+  }, [stopOutputAudio, stopMicrophone, recordedAudioUrl]);
 
   return (
     <div className="space-y-6">
@@ -1810,9 +1838,9 @@ const KeyboardLabModule: React.FC<{
       setPressedKeys((prev) => {
         const next = new Set(prev);
         next.add(code);
-        if (next.size > maxRollover) setMaxRollover(next.size);
         return next;
       });
+      setMaxRollover((prev) => Math.max(prev, pressedKeys.size + 1));
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -2063,13 +2091,25 @@ const DIFFICULTY_CONFIG: Record<AimDifficulty, { label: string; labelVi?: string
   HARD: { label: 'Esport Pro', labelVi: 'Chuyên nghiệp', lifespanMs: 900, badge: 'text-zinc-400 border-white/10 bg-white/[0.02]' }
 };
 
+let sharedAimAudioCtx: AudioContext | null = null;
+const getAimAudioContext = (): AudioContext | null => {
+  if (typeof window === 'undefined') return null;
+  const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+  if (!sharedAimAudioCtx || sharedAimAudioCtx.state === 'closed') {
+    sharedAimAudioCtx = new AudioCtx();
+  }
+  if (sharedAimAudioCtx.state === 'suspended') {
+    sharedAimAudioCtx.resume().catch(() => {});
+  }
+  return sharedAimAudioCtx;
+};
+
 const playAimSound = (type: 'hit' | 'miss' | 'countdown' | 'finish' | 'expire', muted = false) => {
   if (muted || typeof window === 'undefined') return;
   try {
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
-    if (ctx.state === 'suspended') ctx.resume();
+    const ctx = getAimAudioContext();
+    if (!ctx) return;
     const now = ctx.currentTime;
 
     if (type === 'hit') {
@@ -3964,6 +4004,7 @@ const CameraLabModule: React.FC<{
       videoRef.current.srcObject = null;
     }
     setCamActive(false);
+    setSnapshotUrl(null);
   }, []);
 
   const startCamera = async () => {
@@ -4206,7 +4247,35 @@ const GamepadLabModule: React.FC<{
             });
           }
         }
-        setLivePads(active);
+        setLivePads((prev) => {
+          if (prev.length === 0 && active.length === 0) return prev;
+          if (prev.length === active.length) {
+            let unchanged = true;
+            for (let i = 0; i < prev.length; i++) {
+              if (prev[i].id !== active[i].id) { unchanged = false; break; }
+              const pb = prev[i].buttons;
+              const ab = active[i].buttons;
+              if (pb.length !== ab.length) { unchanged = false; break; }
+              for (let b = 0; b < pb.length; b++) {
+                if (pb[b].pressed !== ab[b].pressed || Math.abs(pb[b].value - ab[b].value) > 0.02) {
+                  unchanged = false; break;
+                }
+              }
+              if (!unchanged) break;
+              const pa = prev[i].axes;
+              const aa = active[i].axes;
+              if (pa.length !== aa.length) { unchanged = false; break; }
+              for (let a = 0; a < pa.length; a++) {
+                if (Math.abs(pa[a] - aa[a]) > 0.02) {
+                  unchanged = false; break;
+                }
+              }
+              if (!unchanged) break;
+            }
+            if (unchanged) return prev;
+          }
+          return active;
+        });
       }
       animId = requestAnimationFrame(pollGamepads);
     };
@@ -4468,7 +4537,15 @@ export function App() {
       }).catch(() => {});
     }
 
-    const handleResize = () => setSysInfo(readSystemEnvironment());
+    let resizeRafId: number | null = null;
+    const handleResize = () => {
+      if (resizeRafId !== null) return;
+      resizeRafId = requestAnimationFrame(() => {
+        resizeRafId = null;
+        setSysInfo(readSystemEnvironment());
+      });
+    };
+
     window.addEventListener('resize', handleResize);
     window.addEventListener('gamepadconnected', refreshDevices);
     window.addEventListener('gamepaddisconnected', refreshDevices);
@@ -4478,6 +4555,9 @@ export function App() {
     }
 
     return () => {
+      if (resizeRafId !== null) {
+        cancelAnimationFrame(resizeRafId);
+      }
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('gamepadconnected', refreshDevices);
       window.removeEventListener('gamepaddisconnected', refreshDevices);

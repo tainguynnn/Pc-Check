@@ -347,6 +347,13 @@ export const NetworkLabModule: React.FC<NetworkLabModuleProps> = ({
     setPhase('stopped');
   }, []);
 
+  // Cleanup active speed test and animation frame when unmounting
+  useEffect(() => {
+    return () => {
+      handleStopTest();
+    };
+  }, [handleStopTest]);
+
   // Start test
   const handleStartTest = useCallback(async () => {
     if (isRunning) return;
